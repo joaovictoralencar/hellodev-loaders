@@ -7,7 +7,7 @@ Asset and scene loading utilities using Unity Addressables. Provides loading scr
 ### SceneLoader
 - Async scene loading via Addressables
 - Loading screen management with automatic show/hide
-- Smooth progress tracking with DOTween animations
+- Smooth progress tracking with PrimeTween animations
 - Multiple scene loading support
 - Minimum loading time option (for smooth UX)
 - Network scene loading (with Netcode for GameObjects)
@@ -118,9 +118,7 @@ void Update()
 
 ### Required
 - com.unity.addressables
-
-### Currently Required (Future: Optional via ITweenProvider)
-- DOTween (for progress animations) - will be abstracted behind ITweenProvider interface
+- PrimeTween (for progress animations)
 
 ### Optional
 - Netcode for GameObjects (for network scene loading)

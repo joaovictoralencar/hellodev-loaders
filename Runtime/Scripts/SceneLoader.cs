@@ -1,6 +1,6 @@
 using System.Collections;
 using System.Collections.Generic;
-using DG.Tweening;
+using PrimeTween;
 #if UNITY_NETCODE_GAMEOBJECTS
 using Unity.Netcode;
 #endif
@@ -210,14 +210,13 @@ namespace HelloDev.Loaders
 
                 if (nextGlobalProgress >= lastGlobalProgress)
                 {
-                    progressTween?.Kill();
+                    if (progressTween.isAlive) progressTween.Stop();
                     float targetProgress = Mathf.Min(nextGlobalProgress, .9f);
-                    progressTween = DOTween.To(() => globalProgress, (x) =>
+                    progressTween = Tween.Custom(this, globalProgress, targetProgress, 1f, (loader, x) =>
                     {
-                        globalProgress = x;
-                        lastGlobalProgress = globalProgress;
-                        // Debug.Log("Loading: Global progress: " + globalProgress);
-                    }, targetProgress, 1f).SetEase(Ease.OutQuad);
+                        loader.globalProgress = x;
+                        loader.lastGlobalProgress = loader.globalProgress;
+                    }, Ease.OutQuad);
                 }
 
                 yield return null;
@@ -264,7 +263,7 @@ namespace HelloDev.Loaders
                     if (loadingScreenInstance.Scene.IsValid() && loadingScreenInstance.Scene.isLoaded)
                     {
                         isUnloadingLoadingScreen = true;
-                        DOVirtual.Float(globalProgress, 1, .5f, newProgress => globalProgress = newProgress).SetEase(Ease.OutQuad);
+                        Tween.Custom(this, globalProgress, 1f, 0.5f, (loader, newProgress) => loader.globalProgress = newProgress, Ease.OutQuad);
                         yield return new WaitForSeconds(0.5f); 
                         var handle = Addressables.UnloadSceneAsync(loadingScreenInstance);
                         yield return handle;
