@@ -1,0 +1,25 @@
+{
+    "name": "com.hellodev.loaders",
+    "version": "1.0.0",
+    "displayName": "HelloDev Loaders",
+    "description": "Asset and scene loading utilities using Unity Addressables. Provides loading screens, progress tracking, and async operations.",
+    "unity": "6000.0",
+    "documentationUrl": "",
+    "changelogUrl": "",
+    "licensesUrl": "",
+    "keywords": [
+        "loaders",
+        "addressables",
+        "scenes",
+        "assets",
+        "async"
+    ],
+    "author": {
+        "name": "HelloDev",
+        "email": "",
+        "url": ""
+    },
+    "dependencies": {
+        "com.unity.addressables": "2.3.1"
+    }
+}
