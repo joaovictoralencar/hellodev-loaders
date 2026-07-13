@@ -4,7 +4,10 @@
     "references": [
         "Unity.Addressables",
         "Unity.ResourceManager",
-        "PrimeTween.Runtime"
+        "PrimeTween.Runtime",
+        "HelloDev.Utils",
+        "UniTask",
+        "UniTask.Addressables"
     ],
     "includePlatforms": [],
     "excludePlatforms": [],

@@ -313,7 +313,7 @@ namespace Sakumon.Loader
         {
             if (assetReference == null || !assetReference.IsValid() || !assetReference.RuntimeKeyIsValid())
             {
-                LogVerbose("Release skipped: null or invalid reference.");
+                //LogVerbose("Release skipped: null or invalid reference.");
                 return;
             }
 
