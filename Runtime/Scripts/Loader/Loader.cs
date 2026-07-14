@@ -11,7 +11,7 @@ using UnityEngine.SceneManagement;
 using Logger = HelloDev.Logging.Logger;
 using Object = UnityEngine.Object;
 
-namespace Sakumon.Loader
+namespace HelloDev.Loader
 {
     /// <summary>
     /// Static Addressables facade

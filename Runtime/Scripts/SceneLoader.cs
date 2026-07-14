@@ -16,7 +16,7 @@ using UnityEngine.ResourceManagement.AsyncOperations;
 using UnityEngine.ResourceManagement.ResourceProviders;
 using UnityEngine.SceneManagement;
 
-namespace HelloDev.Loaders
+namespace HelloDev.Loader
 {
     /// <summary>
     /// Manages loading, unloading, and tracking of scenes via Addressables.
