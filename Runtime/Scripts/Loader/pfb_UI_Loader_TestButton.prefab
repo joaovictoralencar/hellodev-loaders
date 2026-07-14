@@ -122,7 +122,7 @@ MonoBehaviour:
     m_PersistentCalls:
       m_Calls:
       - m_Target: {fileID: 0}
-        m_TargetAssemblyTypeName: Sakumon.Loader.AssetLoaderTest, Sakumon.Loader
+        m_TargetAssemblyTypeName: HelloDev.Loader.AssetLoaderTest, HelloDev.Loader
         m_MethodName: LoadAsset
         m_Mode: 1
         m_Arguments:

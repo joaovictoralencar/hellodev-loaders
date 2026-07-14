@@ -12,7 +12,7 @@ using UnityEngine.UI;
 using Object = UnityEngine.Object;
 using Random = UnityEngine.Random;
 
-namespace Sakumon.Loader
+namespace HelloDev.Loader
 {
     /// <summary>
     /// Test MonoBehaviour covering every Loader method.

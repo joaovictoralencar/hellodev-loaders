@@ -1,7 +1,7 @@
 using UnityEngine;
 using UnityEngine.AddressableAssets;
 
-namespace Sakumon.Loader
+namespace HelloDev.Loader
 {
     public interface ILoadingScreen
     {

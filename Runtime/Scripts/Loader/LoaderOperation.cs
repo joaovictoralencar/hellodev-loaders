@@ -2,7 +2,7 @@ using System;
 using System.Threading;
 using Cysharp.Threading.Tasks;
 
-namespace Sakumon.Loader
+namespace HelloDev.Loader
 {
     public class LoaderOperation<T>
     {
