@@ -486,7 +486,7 @@ namespace HelloDev.Loader
         {
             ValidateReference(prefabReference);
 
-            var handle = prefabReference.InstantiateAsync(position, rotation, parent);
+            var handle = prefabReference.InstantiateAsync(parent, true);
             await handle.ToUniTask(progress: progress, cancellationToken: token);
 
             if (handle.Status != AsyncOperationStatus.Succeeded)
@@ -499,6 +499,8 @@ namespace HelloDev.Loader
             var instance = handle.Result;
             LogVerbose($"Instantiated: {instance.name} [{prefabReference.RuntimeKey}] at position: {position}");
             if (releaseOnDestroy) instance.AddComponent<AddressableAutoRelease>();
+            instance.transform.position = position;
+            instance.transform.rotation = rotation;
             return instance;
         }
 
