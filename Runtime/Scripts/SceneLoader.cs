@@ -25,7 +25,14 @@ namespace HelloDev.Loaders
         [SerializeField] private float _minLoadingTime = 5;
         [SerializeField] private AssetReferenceGameObject _loadingScreenReference;
 
-        private enum LoadingScreenState { Hidden, Loading, Showing, Hiding }
+        private enum LoadingScreenState
+        {
+            Hidden,
+            Loading,
+            Showing,
+            Hiding
+        }
+
         private LoadingScreenState _loadingScreenState = LoadingScreenState.Hidden;
         private GameObject _loadingScreenObject;
         private LoaderOperation<GameObject>? _loadingScreenLoadOp;
@@ -352,7 +359,13 @@ namespace HelloDev.Loaders
 
                 // Instantiate via Loader
                 _loadingScreenLoadOp = Loader.Loader.InstantiateAsync(_loadingScreenReference);
-                _loadingScreenObject = await _loadingScreenLoadOp.ToUniTask(token: _loadingScreenCts.Token);
+                if (_loadingScreenLoadOp == null)
+                {
+                    LogError("Failed to instantiate loading screen via Loader");
+                    return;
+                }
+
+                _loadingScreenObject = await _loadingScreenLoadOp;
 
                 _loadingScreenObject.SetActive(true);
                 _loadingScreenState = LoadingScreenState.Showing;
@@ -366,6 +379,7 @@ namespace HelloDev.Loaders
                     _loadingScreenObject = null;
                     _loadingScreenLoadOp = null;
                 }
+
                 _loadingScreenState = LoadingScreenState.Hidden;
                 throw;
             }
@@ -399,7 +413,7 @@ namespace HelloDev.Loaders
                 // Smooth progress bar completion
                 if (_progressTween.isAlive) _progressTween.Stop();
                 await Tween.Custom(this, _globalProgress, 1f, 0.5f,
-                    (loader, x) => loader._globalProgress = x, Ease.OutQuad)
+                        (loader, x) => loader._globalProgress = x, Ease.OutQuad)
                     .ToUniTask(cancellationToken: _loadingScreenCts.Token);
 
                 // Release the instantiated loading screen
@@ -526,8 +540,8 @@ namespace HelloDev.Loaders
     // Unified scene operation wrapper (handles Loader operations and Unity fallback)
     public class SceneOperationWrapper : IEquatable<SceneOperationWrapper>
     {
-        public AsyncOperation AsyncOperation { get; }               // Unity fallback
-        public LoaderOperation LoaderOperation { get; }            // Non‑generic (e.g., unload)
+        public AsyncOperation AsyncOperation { get; } // Unity fallback
+        public LoaderOperation LoaderOperation { get; } // Non‑generic (e.g., unload)
         public LoaderOperation<SceneInstance> LoaderSceneOperation { get; } // Scene load
 
         public string SceneName { get; }
