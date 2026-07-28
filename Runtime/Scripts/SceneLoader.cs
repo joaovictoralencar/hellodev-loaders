@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Threading;
 using Cysharp.Threading.Tasks;
+using HelloDev.Loader;
 using PrimeTween;
 using Logger = HelloDev.Logging.Logger;
 #if UNITY_NETCODE_GAMEOBJECTS
@@ -12,32 +13,28 @@ using Sirenix.OdinInspector;
 #endif
 using UnityEngine;
 using UnityEngine.AddressableAssets;
-using UnityEngine.ResourceManagement.AsyncOperations;
 using UnityEngine.ResourceManagement.ResourceProviders;
 using UnityEngine.SceneManagement;
 
-namespace HelloDev.Loader
+namespace HelloDev.Loaders
 {
-    public class SceneLoader : MonoBehaviour
+    public class SceneLoader : MonoBehaviour, ISceneLoader
     {
         #region Fields
 
         [SerializeField] private float _minLoadingTime = 5;
-        [SerializeField] private AssetReference _loadingScreenReference;
+        [SerializeField] private AssetReferenceGameObject _loadingScreenReference;
 
-        // Loading screen state machine
         private enum LoadingScreenState { Hidden, Loading, Showing, Hiding }
         private LoadingScreenState _loadingScreenState = LoadingScreenState.Hidden;
-        private SceneInstance _loadingScreenInstance;
-        private AsyncOperationHandle<SceneInstance> _loadingScreenLoadHandle;
+        private GameObject _loadingScreenObject;
+        private LoaderOperation<GameObject>? _loadingScreenLoadOp;
         private bool _waitingForMinLoadingTime;
         private CancellationTokenSource _loadingScreenCts;
 
-        // Scene tracking
-        private readonly List<SceneOperationWrapper> _activeHandles = new List<SceneOperationWrapper>();
-        private readonly object _handleLock = new object();
+        private readonly List<SceneOperationWrapper> _activeHandles = new();
+        private readonly object _handleLock = new();
 
-        // Progress
         private float _globalProgress;
         private float _lastGlobalProgress;
         private Tween _progressTween;
@@ -53,7 +50,7 @@ namespace HelloDev.Loader
             get
             {
                 lock (_handleLock)
-                    return _activeHandles.Exists(h => !h.IsDone && h.IsLoading);
+                    return _activeHandles.Exists(w => !w.IsDone && w.IsLoading);
             }
         }
 
@@ -62,7 +59,7 @@ namespace HelloDev.Loader
             get
             {
                 lock (_handleLock)
-                    return _activeHandles.Exists(h => !h.IsDone && !h.IsLoading);
+                    return _activeHandles.Exists(w => !w.IsDone && !w.IsLoading);
             }
         }
 
@@ -111,33 +108,17 @@ namespace HelloDev.Loader
             float startTime = Time.time;
             if (useMinLoadingTime) _waitingForMinLoadingTime = true;
 
-            // Optional safety: if the scene is already loaded, release the handle first (implicit unload)
-            if (sceneReference.OperationHandle.IsValid() && sceneReference.OperationHandle.Status == AsyncOperationStatus.Succeeded)
-            {
-                LogWarning($"Scene '{sceneReference.RuntimeKey}' is already loaded. Releasing previous handle before re‑load.");
-                Addressables.Release(sceneReference.OperationHandle);
-            }
-
-            AsyncOperationHandle<SceneInstance> handle = sceneReference.LoadSceneAsync(loadMode);
-            var wrapper = new SceneOperationWrapper(handle, sceneReference.RuntimeKey.ToString(), true);
+            // Delegate to Loader — handles caching, deduplication, and progress
+            var op = Loader.Loader.LoadSceneAsync(sceneReference, loadMode, activateOnLoad: true);
+            var wrapper = new SceneOperationWrapper(op, sceneReference.RuntimeKey.ToString(), true);
             AddHandle(wrapper);
 
-            // Token cancellation: release if still loading, but dispose registration on completion
-            CancellationTokenRegistration? reg = null;
-            if (token.CanBeCanceled)
+            op.Progress(p => wrapper.Progress = p);
+            op.OnComplete(_ =>
             {
-                reg = token.Register(() =>
-                {
-                    if (handle.IsValid() && !handle.IsDone)
-                        Addressables.Release(handle);
-                });
-            }
-
-            handle.Completed += _ =>
-            {
-                reg?.Dispose(); // prevent late callback
+                wrapper.IsDone = true;
                 OnSceneOperationComplete(wrapper);
-            };
+            });
 
             UpdateGlobalProgressAsync().Forget();
 
@@ -177,32 +158,16 @@ namespace HelloDev.Loader
             {
                 if (string.IsNullOrEmpty(sceneReference.RuntimeKey.ToString())) continue;
 
-                // Optional safety for already loaded scenes
-                if (sceneReference.OperationHandle.IsValid() && sceneReference.OperationHandle.Status == AsyncOperationStatus.Succeeded)
-                {
-                    LogWarning($"Scene '{sceneReference.RuntimeKey}' already loaded – releasing handle before re‑load.");
-                    Addressables.Release(sceneReference.OperationHandle);
-                }
-
-                AsyncOperationHandle<SceneInstance> handle = sceneReference.LoadSceneAsync(loadMode);
-                var wrapper = new SceneOperationWrapper(handle, sceneReference.RuntimeKey.ToString(), true);
+                var op = Loader.Loader.LoadSceneAsync(sceneReference, loadMode, activateOnLoad: true);
+                var wrapper = new SceneOperationWrapper(op, sceneReference.RuntimeKey.ToString(), true);
                 AddHandle(wrapper);
 
-                CancellationTokenRegistration? reg = null;
-                if (token.CanBeCanceled)
+                op.Progress(p => wrapper.Progress = p);
+                op.OnComplete(_ =>
                 {
-                    reg = token.Register(() =>
-                    {
-                        if (handle.IsValid() && !handle.IsDone)
-                            Addressables.Release(handle);
-                    });
-                }
-
-                handle.Completed += _ =>
-                {
-                    reg?.Dispose();
+                    wrapper.IsDone = true;
                     OnSceneOperationComplete(wrapper);
-                };
+                });
             }
 
             UpdateGlobalProgressAsync().Forget();
@@ -226,14 +191,6 @@ namespace HelloDev.Loader
         #endregion
 
         #region Public — Unload (Async)
-        
-        public async UniTask HandleLoadingScreenAsync(bool state, CancellationToken token = default)
-        {
-            if (state)
-                await ShowLoadingScreenAsync(token);
-            else
-                await HideLoadingScreenAsync(token);
-        }
 
         public async UniTask UnloadSceneAsync(Scene scene, bool showLoadingScreen = true,
             CancellationToken token = default)
@@ -248,49 +205,28 @@ namespace HelloDev.Loader
                 await ShowLoadingScreenAsync(token);
 
             SceneOperationWrapper wrapper;
-            AsyncOperationHandle<SceneInstance>? addressableHandle = null;
 
-            lock (_handleLock)
+            // Use Loader if this scene is tracked, else fallback to Unity SceneManager
+            if (Loader.Loader.IsSceneTracked(scene.name))
             {
-                var existing = _activeHandles.Find(h => h.AsyncOperationHandle.HasValue && h.SceneName == scene.name && h.IsLoading);
-                if (existing != null)
-                    addressableHandle = existing.AsyncOperationHandle;
-            }
-
-            if (addressableHandle.HasValue)
-            {
-                var unloadOp = Addressables.UnloadSceneAsync(addressableHandle.Value, true);
-                wrapper = new SceneOperationWrapper(unloadOp, scene.name, false);
+                var op = Loader.Loader.UnloadSceneByNameAsync(scene.name);
+                wrapper = new SceneOperationWrapper(op, scene.name, false);
                 AddHandle(wrapper);
-
-                CancellationTokenRegistration? reg = null;
-                if (token.CanBeCanceled)
+                op.OnComplete(() =>
                 {
-                    reg = token.Register(() =>
-                    {
-                        if (unloadOp.IsValid() && !unloadOp.IsDone)
-                            Addressables.Release(unloadOp);
-                    });
-                }
-
-                unloadOp.Completed += _ =>
-                {
-                    reg?.Dispose();
-                };
+                    wrapper.IsDone = true;
+                    OnSceneOperationComplete(wrapper);
+                });
+                await op.ToUniTask(token: token);
             }
             else
             {
                 AsyncOperation unloadOp = SceneManager.UnloadSceneAsync(scene);
                 wrapper = new SceneOperationWrapper(unloadOp, scene.name, false);
                 AddHandle(wrapper);
+                await UniTask.WaitUntil(() => wrapper.IsDone, cancellationToken: token);
+                OnSceneOperationComplete(wrapper);
             }
-
-            await UniTask.WaitUntil(() => wrapper.IsDone, cancellationToken: token);
-            OnSceneOperationComplete(wrapper);
-
-            // Release the original load handle after successful unload
-            if (addressableHandle.HasValue && addressableHandle.Value.IsValid())
-                Addressables.Release(addressableHandle.Value);
 
             if (showLoadingScreen && _activeHandles.Count == 0)
                 await HideLoadingScreenAsync(token);
@@ -345,18 +281,19 @@ namespace HelloDev.Loader
 
         private void OnLoad(ulong clientId, string sceneName, LoadSceneMode loadSceneMode, AsyncOperation asyncOperation)
         {
-            // Show loading screen using the safe state machine
             CancellationTokenSource cts = new CancellationTokenSource();
             ShowLoadingScreenAsync(cts.Token).Forget();
 
             var wrapper = new SceneOperationWrapper(asyncOperation, sceneName, true);
             AddHandle(wrapper);
 
-            asyncOperation.completed += _ => OnSceneOperationComplete(wrapper);
+            asyncOperation.completed += _ =>
+            {
+                wrapper.IsDone = true;
+                OnSceneOperationComplete(wrapper);
+            };
             UpdateGlobalProgressAsync().Forget();
-
-            // TODO: Hide the loading screen when all clients have loaded (e.g., in OnLoadCompleted).
-            // You may need to keep track of pending client loads and call HideLoadingScreenAsync() when done.
+            // TODO: Hide loading screen when all clients have loaded
         }
 
         private void OnLoadCompleted(ulong clientId, string sceneName, LoadSceneMode loadSceneMode) { }
@@ -374,7 +311,19 @@ namespace HelloDev.Loader
 
         #endregion
 
-        #region Private — Loading Screen State Machine
+        #region Public — Loading Screen Control (manual)
+
+        public async UniTask HandleLoadingScreenAsync(bool state, CancellationToken token = default)
+        {
+            if (state)
+                await ShowLoadingScreenAsync(token);
+            else
+                await HideLoadingScreenAsync(token);
+        }
+
+        #endregion
+
+        #region Private — Loading Screen State Machine (prefab via Loader)
 
         private async UniTask ShowLoadingScreenAsync(CancellationToken token)
         {
@@ -393,29 +342,31 @@ namespace HelloDev.Loader
             _loadingScreenState = LoadingScreenState.Loading;
             try
             {
-                if (_loadingScreenReference.OperationHandle.IsValid())
-                    _loadingScreenReference.ReleaseAsset();
-
-                var handle = _loadingScreenReference.LoadSceneAsync(LoadSceneMode.Additive);
-                _loadingScreenLoadHandle = handle;
-                await handle.ToUniTask(cancellationToken: _loadingScreenCts.Token);
-
-                if (handle.Status == AsyncOperationStatus.Succeeded)
+                // Release previous instance if any
+                if (_loadingScreenObject != null)
                 {
-                    _loadingScreenInstance = handle.Result;
-                    _loadingScreenState = LoadingScreenState.Showing;
+                    Loader.Loader.ReleaseInstance(_loadingScreenObject);
+                    _loadingScreenObject = null;
+                    _loadingScreenLoadOp = null;
                 }
-                else
-                {
-                    LogError("Failed to load the loading screen.");
-                    _loadingScreenState = LoadingScreenState.Hidden;
-                    if (handle.IsValid()) Addressables.Release(handle);
-                }
+
+                // Instantiate via Loader
+                LoaderOperation<GameObject> instantiateOp = Loader.Loader.InstantiateAsync(_loadingScreenReference);
+                _loadingScreenLoadOp = instantiateOp;
+                _loadingScreenObject = await instantiateOp.ToUniTask(token: _loadingScreenCts.Token);
+
+                _loadingScreenObject.SetActive(true);
+                _loadingScreenState = LoadingScreenState.Showing;
             }
             catch (OperationCanceledException)
             {
-                if (_loadingScreenLoadHandle.IsValid())
-                    Addressables.Release(_loadingScreenLoadHandle);
+                if (_loadingScreenLoadOp != null)
+                {
+                    if (_loadingScreenObject != null)
+                        Loader.Loader.ReleaseInstance(_loadingScreenObject);
+                    _loadingScreenObject = null;
+                    _loadingScreenLoadOp = null;
+                }
                 _loadingScreenState = LoadingScreenState.Hidden;
                 throw;
             }
@@ -446,24 +397,22 @@ namespace HelloDev.Loader
             {
                 await UniTask.WaitUntil(() => !_waitingForMinLoadingTime, cancellationToken: _loadingScreenCts.Token);
 
+                // Smooth progress bar completion
                 if (_progressTween.isAlive) _progressTween.Stop();
                 await Tween.Custom(this, _globalProgress, 1f, 0.5f,
                     (loader, x) => loader._globalProgress = x, Ease.OutQuad)
                     .ToUniTask(cancellationToken: _loadingScreenCts.Token);
 
-                if (_loadingScreenInstance.Scene.IsValid() && _loadingScreenInstance.Scene.isLoaded)
+                // Release the instantiated loading screen
+                if (_loadingScreenObject != null)
                 {
-                    var unloadHandle = Addressables.UnloadSceneAsync(_loadingScreenInstance);
-                    await unloadHandle.ToUniTask(cancellationToken: _loadingScreenCts.Token);
+                    Loader.Loader.ReleaseInstance(_loadingScreenObject);
+                    _loadingScreenObject = null;
+                    _loadingScreenLoadOp = null;
                 }
-
-                if (_loadingScreenLoadHandle.IsValid())
-                    Addressables.Release(_loadingScreenLoadHandle);
-                _loadingScreenReference.ReleaseAsset();
 
                 _globalProgress = 0f;
                 _lastGlobalProgress = 0f;
-                _loadingScreenInstance = default;
                 _loadingScreenState = LoadingScreenState.Hidden;
             }
             catch (OperationCanceledException)
@@ -555,16 +504,40 @@ namespace HelloDev.Loader
         #endregion
     }
 
+    // Bridge extensions: convert LoaderOperations into awaitable UniTasks
+    public static class LoaderOperationExtensions
+    {
+        public static async UniTask<T> ToUniTask<T>(this LoaderOperation<T> operation, CancellationToken token = default)
+        {
+            var tcs = new UniTaskCompletionSource<T>();
+            operation.OnComplete(result => tcs.TrySetResult(result));
+            token.Register(() => tcs.TrySetCanceled());
+            return await tcs.Task;
+        }
+
+        public static async UniTask ToUniTask(this LoaderOperation operation, CancellationToken token = default)
+        {
+            var tcs = new UniTaskCompletionSource();
+            operation.OnComplete(() => tcs.TrySetResult());
+            token.Register(() => tcs.TrySetCanceled());
+            await tcs.Task;
+        }
+    }
+
+    // Unified scene operation wrapper (handles Loader operations and Unity fallback)
     public class SceneOperationWrapper : IEquatable<SceneOperationWrapper>
     {
-        public AsyncOperation AsyncOperation { get; }
-        public AsyncOperationHandle<SceneInstance>? AsyncOperationHandle { get; }
+        public AsyncOperation AsyncOperation { get; }               // Unity fallback
+        public LoaderOperation LoaderOperation { get; }            // Non‑generic (e.g., unload)
+        public LoaderOperation<SceneInstance> LoaderSceneOperation { get; } // Scene load
+
         public string SceneName { get; }
         public bool IsLoading { get; }
 
-        public bool IsDone => AsyncOperation?.isDone ?? (AsyncOperationHandle?.IsDone ?? false);
-        public float Progress => AsyncOperation?.progress ?? (AsyncOperationHandle?.PercentComplete ?? 0f);
+        public float Progress { get; set; }
+        public bool IsDone { get; set; }
 
+        // Unity AsyncOperation constructor
         public SceneOperationWrapper(AsyncOperation asyncOperation, string sceneName, bool isLoading)
         {
             AsyncOperation = asyncOperation;
@@ -572,9 +545,18 @@ namespace HelloDev.Loader
             IsLoading = isLoading;
         }
 
-        public SceneOperationWrapper(AsyncOperationHandle<SceneInstance> asyncOperationHandle, string sceneName, bool isLoading)
+        // LoaderOperation (non‑generic) constructor
+        public SceneOperationWrapper(LoaderOperation loaderOperation, string sceneName, bool isLoading)
         {
-            AsyncOperationHandle = asyncOperationHandle;
+            LoaderOperation = loaderOperation;
+            SceneName = sceneName;
+            IsLoading = isLoading;
+        }
+
+        // LoaderOperation<SceneInstance> constructor
+        public SceneOperationWrapper(LoaderOperation<SceneInstance> loaderSceneOperation, string sceneName, bool isLoading)
+        {
+            LoaderSceneOperation = loaderSceneOperation;
             SceneName = sceneName;
             IsLoading = isLoading;
         }

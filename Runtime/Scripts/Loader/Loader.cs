@@ -390,6 +390,14 @@ namespace HelloDev.Loader
             Resources.UnloadUnusedAssets();
             LogVerbose("All cached assets released.");
         }
+        
+        /// <summary>
+        /// Returns true if a scene with the given Unity scene name was loaded via Loader and is still tracked.
+        /// </summary>
+        public static bool IsSceneTracked(string sceneName)
+        {
+            return _sceneNameToKey.ContainsKey(sceneName);
+        }
 
         #endregion
 
