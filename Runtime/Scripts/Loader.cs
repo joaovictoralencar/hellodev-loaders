@@ -71,7 +71,7 @@ namespace HelloDev.Loader
         #endregion
 
         #region Load
-        
+
         /// <summary>
         /// Loads and caches an asset. Cancellation via token aborts the await and throws OperationCanceledException.
         /// </summary>
@@ -243,12 +243,18 @@ namespace HelloDev.Loader
         /// Loads an Addressable scene and caches its handle for unloading.
         /// Use LoadSceneMode.Additive to layer scenes. LoadSceneMode.Single triggers UnloadUnusedAssets automatically.
         /// WARNING: activateOnLoad = false blocks the entire Addressables queue until ActivateAsync() is called.
+        /// Cancelling the operation's token cannot abort the underlying Addressables operation once started
+        /// (Addressables offers no hard-cancel API) — instead, the scene is auto-unloaded once it finishes
+        /// loading, so a cancelled request never leaves an orphaned, untracked scene behind.
         /// </summary>
         public static LoaderOperation<SceneInstance> LoadSceneAsync(
             AssetReference sceneReference,
             LoadSceneMode loadMode = LoadSceneMode.Additive,
             bool activateOnLoad = true)
-            => new((progress, token) => LoadSceneInternalAsync(sceneReference, loadMode, activateOnLoad, progress));
+            // FIX (Scenario A): the token was previously dropped here — the factory ignored its
+            // `token` parameter and called LoadSceneInternalAsync without one at all, so a cancelled
+            // caller had zero effect on the in-flight Addressables operation.
+            => new((progress, token) => LoadSceneInternalAsync(sceneReference, loadMode, activateOnLoad, progress, token));
 
 
         /// <summary>
@@ -390,7 +396,7 @@ namespace HelloDev.Loader
             Resources.UnloadUnusedAssets();
             LogVerbose("All cached assets released.");
         }
-        
+
         /// <summary>
         /// Returns true if a scene with the given Unity scene name was loaded via Loader and is still tracked.
         /// </summary>
@@ -526,7 +532,8 @@ namespace HelloDev.Loader
             AssetReference sceneReference,
             LoadSceneMode loadMode,
             bool activateOnLoad,
-            IProgress<float> progress)
+            IProgress<float> progress,
+            CancellationToken token = default)
         {
             ValidateReference(sceneReference);
             string key = sceneReference.RuntimeKey.ToString();
@@ -561,12 +568,26 @@ namespace HelloDev.Loader
             AsyncOperationHandle<SceneInstance> handle = Addressables.LoadSceneAsync(sceneReference, loadMode, activateOnLoad);
             _sceneHandles[key] = handle;
 
-            await handle.ToUniTask(progress: progress);
+            try
+            {
+                await handle.ToUniTask(progress: progress, cancellationToken: token);
+            }
+            catch (OperationCanceledException)
+            {
+                // FIX (Scenario A): Addressables gives us no way to actually abort an in-flight
+                // operation. Rather than let it finish silently and untracked (an orphaned scene
+                // nobody knows about), keep the handle tracked and auto-unload it the moment it
+                // does finish.
+                LogWarning($"LoadSceneAsync cancelled: {key}. Will auto-unload once the in-flight load completes.");
+                AutoUnloadOnCancelledLoadAsync(key, handle).Forget();
+                throw;
+            }
 
             if (handle.Status != AsyncOperationStatus.Succeeded)
             {
                 LogError($"Scene load failed: {key}");
-                _sceneHandles.Remove(key);
+                if (_sceneHandles.TryGetValue(key, out var current) && current.Equals(handle))
+                    _sceneHandles.Remove(key);
                 handle.Release();
                 throw new Exception($"[Loader] Scene load failed. Key: {key}");
             }
@@ -579,6 +600,54 @@ namespace HelloDev.Loader
             return handle.Result;
         }
 
+        // FIX (Scenario A): completes the auto-unload of a scene whose load was cancelled by the
+        // caller after the Addressables operation had already started. Only touches tracking state
+        // if nothing newer has since replaced the handle for this key, so it can never clobber a
+        // legitimate subsequent load of the same scene.
+        private static async UniTask AutoUnloadOnCancelledLoadAsync(string key, AsyncOperationHandle<SceneInstance> handle)
+        {
+            if (!handle.IsDone)
+                await handle.ToUniTask();
+
+            bool stillTrackedAsThisHandle = _sceneHandles.TryGetValue(key, out var tracked) && tracked.Equals(handle);
+
+            if (handle.Status != AsyncOperationStatus.Succeeded)
+            {
+                if (stillTrackedAsThisHandle) _sceneHandles.Remove(key);
+                handle.Release();
+                return;
+            }
+
+            LogVerbose($"Cancelled load finished after the fact, auto-unloading: {key}");
+            if (stillTrackedAsThisHandle) _sceneHandles.Remove(key);
+
+            var unloadHandle = Addressables.UnloadSceneAsync(handle);
+            await unloadHandle.ToUniTask();
+
+            if (unloadHandle.Status != AsyncOperationStatus.Succeeded)
+                LogError($"Auto-unload of cancelled load failed: {key}");
+
+            RemoveStaleSceneName(key);
+        }
+
+        // FIX (Scenario E): shared helper — scrubs the reverse name→key mapping for a key that no
+        // longer has a handle, regardless of which unload path removed it.
+        private static void RemoveStaleSceneName(string key)
+        {
+            string staleName = null;
+            foreach (var pair in _sceneNameToKey)
+            {
+                if (pair.Value == key)
+                {
+                    staleName = pair.Key;
+                    break;
+                }
+            }
+
+            if (staleName != null)
+                _sceneNameToKey.Remove(staleName);
+        }
+
         private static async UniTask UnloadSceneInternalAsync(AssetReference sceneReference)
         {
             if (sceneReference == null || !sceneReference.RuntimeKeyIsValid())
@@ -588,7 +657,13 @@ namespace HelloDev.Loader
             }
 
             string key = sceneReference.RuntimeKey.ToString();
-            await UnloadSceneByKeyInternalAsync(key);
+            bool unloaded = await UnloadSceneByKeyInternalAsync(key);
+
+            // FIX (Scenario E): this path (unload by AssetReference) previously never touched
+            // _sceneNameToKey at all, leaving a stale name→key entry behind after a successful
+            // unload if the caller didn't go through UnloadSceneByNameAsync.
+            if (unloaded)
+                RemoveStaleSceneName(key);
         }
 
         private static async UniTask UnloadSceneByNameInternalAsync(string sceneName)
@@ -599,44 +674,63 @@ namespace HelloDev.Loader
                 return;
             }
 
-            _sceneNameToKey.Remove(sceneName);
-            await UnloadSceneByKeyInternalAsync(key);
+            bool unloaded = await UnloadSceneByKeyInternalAsync(key);
+
+            // FIX (Scenario E): previously this mapping was removed *before* the unload was
+            // awaited. If the unload then failed, IsSceneTracked(sceneName) would start lying —
+            // returning false for a scene Addressables still considered loaded — which could send
+            // a later SceneLoader.UnloadSceneAsync call down the wrong (raw SceneManager) path.
+            if (unloaded)
+                _sceneNameToKey.Remove(sceneName);
         }
 
-        // Shared unload path used by both UnloadSceneInternalAsync and UnloadSceneByNameInternalAsync.
-        private static async UniTask UnloadSceneByKeyInternalAsync(string key)
+        // Shared unload path used by UnloadSceneInternalAsync and UnloadSceneByNameInternalAsync.
+        // Returns true only if the handle was actually unloaded and removed from tracking.
+        private static async UniTask<bool> UnloadSceneByKeyInternalAsync(string key)
         {
             if (!_sceneHandles.TryGetValue(key, out var handle))
             {
                 LogWarning($"UnloadScene skipped: no handle for key '{key}'.");
-                return;
+                return false;
             }
 
-            _sceneHandles.Remove(key);
             var unloadHandle = Addressables.UnloadSceneAsync(handle);
             await unloadHandle.ToUniTask();
 
             if (unloadHandle.Status != AsyncOperationStatus.Succeeded)
-                LogError($"Scene unload failed: {key}");
-            else
-                LogVerbose($"Scene unloaded: {key}");
+            {
+                // FIX (Scenario E): keep the handle tracked on failure instead of removing it
+                // pre-emptively — the scene may still be loaded, and a caller should be able to
+                // see that (via IsSceneTracked) and retry the unload.
+                LogError($"Scene unload failed, keeping handle tracked for retry: {key}");
+                return false;
+            }
+
+            _sceneHandles.Remove(key);
+            LogVerbose($"Scene unloaded: {key}");
+            return true;
         }
 
         private static async UniTask UnloadAllScenesInternalAsync()
         {
             var keys = new List<string>(_sceneHandles.Keys);
-            var tasks = new List<UniTask>(keys.Count);
+            var tasks = new List<UniTask<bool>>(keys.Count);
 
             foreach (var key in keys)
+                tasks.Add(UnloadSceneByKeyInternalAsync(key));
+
+            // FIX (Scenario E): previously every handle and the entire _sceneNameToKey map were
+            // cleared *before* the unloads were awaited, and success/failure was never checked.
+            // A failed unload would silently lose all tracking for a scene that was still loaded.
+            var results = await UniTask.WhenAll(tasks);
+
+            for (int i = 0; i < keys.Count; i++)
             {
-                var handle = _sceneHandles[key];
-                _sceneHandles.Remove(key);
-                tasks.Add(Addressables.UnloadSceneAsync(handle).ToUniTask());
+                if (results[i])
+                    RemoveStaleSceneName(keys[i]);
             }
 
-            _sceneNameToKey.Clear();
-            await UniTask.WhenAll(tasks);
-            LogVerbose("All scenes unloaded.");
+            LogVerbose("UnloadAllScenes complete.");
         }
 
         #endregion

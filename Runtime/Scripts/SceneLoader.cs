@@ -107,7 +107,11 @@ namespace HelloDev.Loaders
             if (token.IsCancellationRequested) return;
 
             if (unloadAll)
-                await UnloadAllScenesAsync(showLoadingScreen, token: token);
+                // FIX (Scenario B): previously called with hideOnFinish defaulting to true, so the
+                // loading screen would hide here and then immediately show again a few lines down —
+                // a visible flicker plus a wasted release/reinstantiate of the loading-screen prefab.
+                // Keep it up continuously across the unload+load sequence instead.
+                await UnloadAllScenesAsync(showLoadingScreen, hideOnFinish: false, token: token);
 
             if (showLoadingScreen)
                 await ShowLoadingScreenAsync(token);
@@ -116,8 +120,8 @@ namespace HelloDev.Loaders
             if (useMinLoadingTime) _waitingForMinLoadingTime = true;
 
             // Delegate to Loader — handles caching, deduplication, and progress
-            var op = Loader.Loader.LoadSceneAsync(sceneReference, loadMode, activateOnLoad: true);
-            var wrapper = new SceneOperationWrapper(op, sceneReference.RuntimeKey.ToString(), true);
+            LoaderOperation<SceneInstance> op = Loader.Loader.LoadSceneAsync(sceneReference, loadMode, activateOnLoad: true);
+            SceneOperationWrapper wrapper = new SceneOperationWrapper(op, sceneReference.RuntimeKey.ToString(), true);
             AddHandle(wrapper);
 
             op.Progress(p => wrapper.Progress = p);
@@ -129,8 +133,22 @@ namespace HelloDev.Loaders
 
             UpdateGlobalProgressAsync().Forget();
 
+            // `op` is lazy — LoaderOperation only runs its factory when awaited or Forgotten.
+            // ToUniTask() both starts the load and lets us wait for it, without disturbing the
+            // Progress/OnComplete callbacks attached above.
+            UniTask loadTask = op.ToUniTask(token);
+
             if (useMinLoadingTime)
-                await LoadingWaitingTimeAsync(Mathf.Max(0, _minLoadingTime - (Time.time - startTime)), token);
+            {
+                float remaining = Mathf.Max(0, _minLoadingTime - (Time.time - startTime));
+                // Run the scene load and the minimum-loading-time delay concurrently — the method
+                // now genuinely waits for the scene to finish loading, not just for the timer.
+                await UniTask.WhenAll(loadTask, LoadingWaitingTimeAsync(remaining, token));
+            }
+            else
+            {
+                await loadTask;
+            }
         }
 
         public async UniTask LoadSceneAsync(AssetReference[] scenesReferences, LoadSceneMode loadMode,
@@ -161,9 +179,14 @@ namespace HelloDev.Loaders
             if (showLoadingScreen)
                 await ShowLoadingScreenAsync(token);
 
+            var loadTasks = new List<UniTask>();
+
             foreach (var sceneReference in scenesReferences)
             {
-                if (string.IsNullOrEmpty(sceneReference.RuntimeKey.ToString())) continue;
+                // Guard against null/invalid entries — the validation loop above only logs a
+                // warning, it doesn't filter them out of the array.
+                if (sceneReference == null || string.IsNullOrEmpty(sceneReference.RuntimeKey.ToString()))
+                    continue;
 
                 var op = Loader.Loader.LoadSceneAsync(sceneReference, loadMode, activateOnLoad: true);
                 var wrapper = new SceneOperationWrapper(op, sceneReference.RuntimeKey.ToString(), true);
@@ -175,11 +198,19 @@ namespace HelloDev.Loaders
                     wrapper.IsDone = true;
                     OnSceneOperationComplete(wrapper);
                 });
+
+                loadTasks.Add(op.ToUniTask(token));
             }
 
             UpdateGlobalProgressAsync().Forget();
-            float remaining = Mathf.Max(0, _minLoadingTime - (Time.time - timeStart));
-            await LoadingWaitingTimeAsync(remaining, token);
+
+            if (useMinLoadingTime)
+            {
+                float remaining = Mathf.Max(0, _minLoadingTime - (Time.time - timeStart));
+                loadTasks.Add(LoadingWaitingTimeAsync(remaining, token));
+            }
+
+            await UniTask.WhenAll(loadTasks);
         }
 
         public void LoadSceneAsyncForget(AssetReference sceneReference, LoadSceneMode loadMode,
@@ -224,6 +255,8 @@ namespace HelloDev.Loaders
                     wrapper.IsDone = true;
                     OnSceneOperationComplete(wrapper);
                 });
+                // ToUniTask() no longer re-registers its own OnComplete, so this callback is
+                // preserved — it actually starts and awaits the unload now.
                 await op.ToUniTask(token: token);
             }
             else
@@ -231,12 +264,23 @@ namespace HelloDev.Loaders
                 AsyncOperation unloadOp = SceneManager.UnloadSceneAsync(scene);
                 wrapper = new SceneOperationWrapper(unloadOp, scene.name, false);
                 AddHandle(wrapper);
+
+                // Wire the AsyncOperation's own completion into the wrapper — nothing else was
+                // ever setting wrapper.IsDone in this branch, so the WaitUntil below would
+                // otherwise wait on a flag that could never flip.
+                unloadOp.completed += _ =>
+                {
+                    wrapper.IsDone = true;
+                    OnSceneOperationComplete(wrapper);
+                };
+
                 await UniTask.WaitUntil(() => wrapper.IsDone, cancellationToken: token);
-                OnSceneOperationComplete(wrapper);
             }
 
-            if (showLoadingScreen && _activeHandles.Count == 0)
-                await HideLoadingScreenAsync(token);
+            // FIX (Scenario D): removed the redundant explicit hide-check that used to sit here.
+            // OnSceneOperationComplete (triggered above, for both branches) already hides the
+            // loading screen once no handles remain — and it does so correctly regardless of this
+            // call's own showLoadingScreen flag, which the old check here incorrectly gated on.
         }
 
         public async UniTask UnloadAllScenesAsync(bool showLoadingScreen, bool hideOnFinish = true,
@@ -298,6 +342,9 @@ namespace HelloDev.Loaders
             {
                 wrapper.IsDone = true;
                 OnSceneOperationComplete(wrapper);
+                // FIX (Scenario F): dispose the CTS once the load completes — it was previously
+                // created and never disposed, leaking one per client connection/scene load.
+                cts.Dispose();
             };
             UpdateGlobalProgressAsync().Forget();
             // TODO: Hide loading screen when all clients have loaded
@@ -519,20 +566,22 @@ namespace HelloDev.Loaders
     // Bridge extensions: convert LoaderOperations into awaitable UniTasks
     public static class LoaderOperationExtensions
     {
+        // Previously called operation.OnComplete(...) itself, which — because LoaderOperation's
+        // OnComplete is a single-subscriber field, not a multicast event — silently overwrote any
+        // OnComplete callback the caller had already attached. It also never awaited or Forgot the
+        // operation, so RunAsync() (and therefore the actual load/unload work) never ran and
+        // callers awaiting this would hang forever. Awaiting the operation directly triggers
+        // execution AND preserves whatever callbacks the caller already set.
         public static async UniTask<T> ToUniTask<T>(this LoaderOperation<T> operation, CancellationToken token = default)
         {
-            var tcs = new UniTaskCompletionSource<T>();
-            operation.OnComplete(result => tcs.TrySetResult(result));
-            token.Register(() => tcs.TrySetCanceled());
-            return await tcs.Task;
+            operation.WithCancellation(token);
+            return await operation;
         }
 
         public static async UniTask ToUniTask(this LoaderOperation operation, CancellationToken token = default)
         {
-            var tcs = new UniTaskCompletionSource();
-            operation.OnComplete(() => tcs.TrySetResult());
-            token.Register(() => tcs.TrySetCanceled());
-            await tcs.Task;
+            operation.WithCancellation(token);
+            await operation;
         }
     }
 
