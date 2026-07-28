@@ -351,9 +351,8 @@ namespace HelloDev.Loaders
                 }
 
                 // Instantiate via Loader
-                LoaderOperation<GameObject> instantiateOp = Loader.Loader.InstantiateAsync(_loadingScreenReference);
-                _loadingScreenLoadOp = instantiateOp;
-                _loadingScreenObject = await instantiateOp.ToUniTask(token: _loadingScreenCts.Token);
+                _loadingScreenLoadOp = Loader.Loader.InstantiateAsync(_loadingScreenReference);
+                _loadingScreenObject = await _loadingScreenLoadOp.ToUniTask(token: _loadingScreenCts.Token);
 
                 _loadingScreenObject.SetActive(true);
                 _loadingScreenState = LoadingScreenState.Showing;
