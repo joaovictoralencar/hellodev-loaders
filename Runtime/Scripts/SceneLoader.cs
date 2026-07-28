@@ -430,8 +430,8 @@ namespace HelloDev.Loaders
         {
             if (_loadingScreenCts != null)
             {
-                _loadingScreenCts.Cancel();
-                _loadingScreenCts.Dispose();
+                _loadingScreenCts?.Dispose();
+                _loadingScreenCts?.Cancel();
                 _loadingScreenCts = null;
             }
         }
